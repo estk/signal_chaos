@@ -1,6 +1,7 @@
 use std::{
     env,
     io::{self, BufRead},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -55,10 +56,7 @@ fn worker() {
             continue;
         }
         let bs = buf.as_bytes();
-        let end = size_of::<i32>();
-        let mut buf = 0_i32.to_ne_bytes();
-        buf.copy_from_slice(&bs[..end]);
-        let sig = i32::from_ne_bytes(buf);
+        let sig = read_sig(bs);
 
         info!("read signal: {sig}");
         if sig == libc::SIGINT {
@@ -106,15 +104,7 @@ fn manager() {
 
         let spawn_fut = async move {
             let mut event_rx = event_tx_ref.subscribe();
-            let mut cmd = Command::new(exe);
-
-            // We set gid to 0 so that it gets its own group and does not get signals sent to the root process group.
-            let mut jh = cmd
-                .arg("-w")
-                .process_group(0)
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap();
+            let mut jh = spawn_child(&exe);
 
             let pid = Pid::from_raw(jh.id().unwrap().try_into().unwrap());
             let mut child_stdin = jh.stdin.take().unwrap();
@@ -129,14 +119,13 @@ fn manager() {
                         // which would require the worker to implement signal handling as well.
 
                         debug!("forwarding signal to {pid:?}");
-                        let mut sbs = sig.to_ne_bytes().to_vec();
-                        sbs.push(b'\n');
-                        child_stdin.write_all(&sbs).await.unwrap();
+
+                        let line = sig_to_line_bs(sig);
+                        child_stdin.write_all(&line).await.unwrap();
                         child_stdin.flush().await.unwrap();
                     }
 
                     _ = jh.wait() => {
-                        debug!("wait done");
                         cancellation_sender.send(()).unwrap();
                         break
                     }
@@ -145,4 +134,30 @@ fn manager() {
         };
         scope.spawn_cancellable(spawn_fut, || ());
     });
+}
+
+fn read_sig(bs: &[u8]) -> i32 {
+    let end = size_of::<i32>();
+    let mut buf = 0_i32.to_ne_bytes();
+    buf.copy_from_slice(&bs[..end]);
+    i32::from_ne_bytes(buf)
+}
+
+fn sig_to_line_bs(sig: i32) -> Vec<u8> {
+    let mut sbs = sig.to_ne_bytes().to_vec();
+    sbs.push(b'\n');
+    sbs
+}
+
+fn spawn_child(exe: &Path) -> tokio::process::Child {
+    let mut cmd = Command::new(exe);
+
+    // We set gid to 0 so that it gets its own group and does not get signals sent to the root process group.
+    let jh = cmd
+        .arg("-w")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    jh
 }
