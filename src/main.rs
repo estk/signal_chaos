@@ -1,12 +1,21 @@
-use std::{env, thread::sleep, time::Duration};
+use std::{
+    env,
+    io::{self, BufRead},
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use async_scoped::TokioScope;
 use clap::Parser;
 use nix::unistd::Pid;
 use signal_chaos::SignalHandler;
-use tokio::{process::Command, sync::broadcast};
-use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tokio::{io::AsyncWriteExt, process::Command, sync::broadcast};
+use tracing::{debug, info, instrument};
+use tracing_subscriber::{
+    fmt::{self, format::FmtSpan},
+    prelude::*,
+    EnvFilter,
+};
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -16,20 +25,49 @@ struct Cli {
 
 fn main() {
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_span_events(FmtSpan::ACTIVE))
         .with(EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
     info!("cli: {cli:?}");
+
     if cli.worker {
-        println!("i am worker");
-        sleep(Duration::from_secs(10));
+        worker();
     } else {
-        println!("i am manager");
         manager()
     }
 }
+
+#[instrument]
+fn worker() {
+    let mut buf = String::new();
+    let started = Instant::now();
+
+    loop {
+        if started.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        let mut stdin = io::stdin().lock();
+
+        let read_count = stdin.read_line(&mut buf).unwrap();
+        if read_count == 0 {
+            continue;
+        }
+        let bs = buf.as_bytes();
+        let end = size_of::<i32>();
+        let mut buf = 0_i32.to_ne_bytes();
+        buf.copy_from_slice(&bs[..end]);
+        let sig = i32::from_ne_bytes(buf);
+
+        info!("read signal: {sig}");
+        if sig == libc::SIGINT {
+            break;
+        }
+    }
+}
+
+#[instrument]
 fn manager() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _rtg = rt.enter();
@@ -55,7 +93,7 @@ fn manager() {
                                 continue;
                             }
                         };
-                        println!("sending {event:?}");
+                        info!("sending {event:?}");
                         event_tx_ref.send(event).unwrap();
                     }
                     _ = cancellation_receiver.recv() => {
@@ -63,35 +101,48 @@ fn manager() {
                     }
                 };
             }
-            println!("exiting event loop");
         };
         scope.spawn_cancellable(event_fut, || ());
 
-        let worker_fut = async move {
+        let spawn_fut = async move {
             let mut event_rx = event_tx_ref.subscribe();
             let mut cmd = Command::new(exe);
-            let mut jh = cmd.arg("-w").spawn().unwrap();
-            // let id = jh.id().unwrap();
+
+            // We set gid to 0 so that it gets its own group and does not get signals sent to the root process group.
+            let mut jh = cmd
+                .arg("-w")
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let pid = Pid::from_raw(jh.id().unwrap().try_into().unwrap());
+            let mut child_stdin = jh.stdin.take().unwrap();
 
             loop {
                 tokio::select! {
                     evt = event_rx.recv() => {
-                        // send this sig to the current processes group
-                        let pid = Pid::from_raw(0);
-                        let sig = evt.unwrap().as_nix_sig();
+                        let sig = evt.unwrap().as_sig();
 
-                        println!("killing {pid:?}");
-                        nix::sys::signal::kill(pid, sig).unwrap();
+                        // Here we just write the signal to the stdin of the child process.
+                        // This is the simplest way of communicating this without actually passing a signal
+                        // which would require the worker to implement signal handling as well.
+
+                        debug!("forwarding signal to {pid:?}");
+                        let mut sbs = sig.to_ne_bytes().to_vec();
+                        sbs.push(b'\n');
+                        child_stdin.write_all(&sbs).await.unwrap();
+                        child_stdin.flush().await.unwrap();
                     }
+
                     _ = jh.wait() => {
-                        println!("wait done");
-                        cancellation_sender.send(());
+                        debug!("wait done");
+                        cancellation_sender.send(()).unwrap();
                         break
                     }
                 };
             }
-            println!("exiting worker manager loop");
         };
-        scope.spawn_cancellable(worker_fut, || ());
+        scope.spawn_cancellable(spawn_fut, || ());
     });
 }

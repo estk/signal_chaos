@@ -1,6 +1,6 @@
 //! Yoink https://github.com/nextest-rs/nextest/blob/main/nextest-runner/src/signal.rs#L33
 
-use nix::sys::signal::Signal;
+use libc::c_int;
 use thiserror::Error;
 
 mod imp;
@@ -20,6 +20,7 @@ impl SignalHandler {
     }
 
     /// Creates a new `SignalReceiver` that does nothing.
+    #[allow(dead_code)]
     pub(crate) fn noop() -> Self {
         Self { signals: None }
     }
@@ -43,13 +44,13 @@ pub enum SignalEvent {
     Shutdown(ShutdownEvent),
 }
 impl SignalEvent {
-    pub fn as_nix_sig(&self) -> Signal {
+    pub fn as_sig(&self) -> c_int {
         match self {
-            Self::JobControl(JobControlEvent::Stop) => Signal::SIGSTOP,
-            Self::JobControl(JobControlEvent::Continue) => Signal::SIGCONT,
-            Self::Shutdown(ShutdownEvent::Hangup) => Signal::SIGHUP,
-            Self::Shutdown(ShutdownEvent::Interrupt) => Signal::SIGINT,
-            Self::Shutdown(ShutdownEvent::Term) => Signal::SIGTERM,
+            Self::JobControl(JobControlEvent::Stop) => libc::SIGSTOP,
+            Self::JobControl(JobControlEvent::Continue) => libc::SIGCONT,
+            Self::Shutdown(ShutdownEvent::Hangup) => libc::SIGHUP,
+            Self::Shutdown(ShutdownEvent::Interrupt) => libc::SIGINT,
+            Self::Shutdown(ShutdownEvent::Term) => libc::SIGTERM,
         }
     }
 }
