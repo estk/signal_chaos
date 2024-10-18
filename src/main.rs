@@ -3,7 +3,8 @@ use std::{
     io::{self, BufRead},
     path::Path,
     process::Stdio,
-    time::{Duration, Instant},
+    thread,
+    time::Duration,
 };
 
 use async_scoped::TokioScope;
@@ -43,26 +44,30 @@ fn main() {
 #[instrument]
 fn worker() {
     let mut buf = String::new();
-    let started = Instant::now();
 
-    loop {
-        if started.elapsed() > Duration::from_secs(10) {
-            break;
-        }
-        let mut stdin = io::stdin().lock();
+    let (timeout_tx, timeout_rx) = crossbeam::channel::bounded(0);
 
-        let read_count = stdin.read_line(&mut buf).unwrap();
-        if read_count == 0 {
-            continue;
-        }
-        let bs = buf.as_bytes();
-        let sig = read_sig(bs);
+    thread::spawn(move || {
+        loop {
+            let mut stdin = io::stdin().lock();
 
-        info!("read signal: {sig}");
-        if sig == libc::SIGINT {
-            break;
+            let read_count = stdin.read_line(&mut buf).unwrap();
+            if read_count == 0 {
+                continue;
+            }
+            let bs = buf.as_bytes();
+            let sig = read_sig(bs);
+
+            info!("read signal: {sig}");
+            if sig == libc::SIGINT {
+                break;
+            }
         }
-    }
+        timeout_tx.send(libc::SIGINT).unwrap()
+    });
+
+    let sig = timeout_rx.recv_timeout(Duration::from_secs(10));
+    info!("signal: {sig:?}");
 }
 
 #[instrument]
